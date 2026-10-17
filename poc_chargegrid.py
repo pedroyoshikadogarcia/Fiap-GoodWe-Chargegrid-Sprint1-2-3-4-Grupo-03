@@ -3,19 +3,20 @@ import pandas as pd
 import time
 import altair as alt
 
-st.set_page_config(page_title="ChargeGrid Intelligence - Sprint 3", layout="centered")
+st.set_page_config(page_title="ChargeGrid Intelligence - Sprint 4", layout="centered")
 
-st.title("ChargeGrid Intelligence")
-st.caption("GoodWe Challenge - Prova de Conceito Integrada (Sprint 3)")
+st.title("ChargeGrid Intelligence - Solução Final Integrada")
+st.caption("GoodWe Challenge - Sistema Inteligente de Gestão Energética e BESS (Sprint 4)")
 
 POTENCIA_CONTRATADA_BASE = 150.0
 CAPACIDADE_MAX_CARREGADOR = 22.0
+CAPACIDADE_BATERIA_KWH = 100.0
 
 st.sidebar.header("Modo de Operação")
 modo_simulacao = st.sidebar.radio("Selecione o Controle", ["Manual", "Simulação Automática (24h)"])
 
 
-def processar_telemetria(hora_simulada, consumo_predio, geracao_solar, potencia_limite, status_horario):
+def processar_telemetria(hora_simulada, consumo_predio, geracao_solar, potencia_limite, status_horario, soc_bateria=95.0):
     estacoes_recarga = {
         "Estacao_01_VanFrota": {"carro_conectado": True, "potencia_atual_kw": CAPACIDADE_MAX_CARREGADOR,
                                 "prioridade": "Alta"},
@@ -25,16 +26,27 @@ def processar_telemetria(hora_simulada, consumo_predio, geracao_solar, potencia_
                                  "prioridade": "Baixa"}
     }
 
+    descarga_bateria_kw = 0.0
     demanda_liquida_predio = max(0.0, consumo_predio - geracao_solar)
     demanda_carregadores_inicial = sum(estacao["potencia_atual_kw"] for estacao in estacoes_recarga.values())
-    demanda_total_sistema = demanda_liquida_predio + demanda_carregadores_inicial
+    demanda_total_bruta = demanda_liquida_predio + demanda_carregadores_inicial
+
+    if demanda_total_bruta > potencia_limite and soc_bateria > 10.0:
+        excesso_inicial = demanda_total_bruta - potencia_limite
+        descarga_bateria_kw = min(excesso_inicial, 35.0)
+        soc_bateria = max(10.0, soc_bateria - (descarga_bateria_kw * 0.1))
+
+    demanda_liquida_apos_bateria = max(0.0, demanda_total_bruta - descarga_bateria_kw)
 
     dlb_ativo = False
     logs_dlb = []
 
-    if demanda_total_sistema > potencia_limite:
+    if descarga_bateria_kw > 0.0:
+        logs_dlb.append(f"Bateria GoodWe BESS em descarga: fornecendo {descarga_bateria_kw:.1f} kW à rede predial.")
+
+    if demanda_liquida_apos_bateria > potencia_limite:
         dlb_ativo = True
-        excesso = demanda_total_sistema - potencia_limite
+        excesso = demanda_liquida_apos_bateria - potencia_limite
         ordem_corte = ["Baixa", "Média", "Alta"]
 
         for prioridade in ordem_corte:
@@ -56,8 +68,14 @@ def processar_telemetria(hora_simulada, consumo_predio, geracao_solar, potencia_
         for dados in estacoes_recarga.values():
             dados["potencia_atual_kw"] = CAPACIDADE_MAX_CARREGADOR
 
+    if geracao_solar > consumo_predio and soc_bateria < 100.0:
+        soc_bateria = min(100.0, soc_bateria + 2.0)
+
     demanda_carregadores_final = sum(estacao["potencia_atual_kw"] for estacao in estacoes_recarga.values())
-    demanda_final_sistema = demanda_liquida_predio + demanda_carregadores_final
+    demanda_final_sistema = max(0.0, (demanda_liquida_predio - descarga_bateria_kw) + demanda_carregadores_final)
+
+    co2_evitado_kg = geracao_solar * 0.084
+    economia_reais = (geracao_solar * 0.65) + (descarga_bateria_kw * 0.90)
 
     return {
         "hora": hora_simulada,
@@ -69,7 +87,11 @@ def processar_telemetria(hora_simulada, consumo_predio, geracao_solar, potencia_
         "logs_dlb": logs_dlb,
         "estacoes": estacoes_recarga,
         "demanda_liquida": demanda_liquida_predio,
-        "status_horario": status_horario
+        "status_horario": status_horario,
+        "soc_bateria": soc_bateria,
+        "descarga_bateria_kw": descarga_bateria_kw,
+        "co2_evitado_kg": co2_evitado_kg,
+        "economia_reais": economia_reais
     }
 
 
@@ -78,21 +100,29 @@ def renderizar_dashboard(dados, container):
         with st.container(border=True):
             col1, col2 = st.columns(2)
             col1.metric("Consumo do Prédio", f"{dados['consumo_predio']:.1f} kW")
-            col2.metric("Geração Solar", f"{dados['geracao_solar']:.1f} kW")
+            col2.metric("Geração Solar GoodWe", f"{dados['geracao_solar']:.1f} kW")
 
             col3, col4 = st.columns(2)
-            col3.metric("Demanda Total", f"{dados['demanda_final']:.1f} / {dados['potencia_limite']:.1f} kW")
+            col3.metric("Bateria GoodWe BESS (SoC)", f"{dados['soc_bateria']:.1f}%",
+                        delta=f"-{dados['descarga_bateria_kw']:.1f} kW" if dados['descarga_bateria_kw'] > 0 else "Standby")
             if dados['dlb_ativo']:
                 col4.metric("Status DLB", "SOBRECARGA", delta="Atuação Dinâmica", delta_color="inverse")
             else:
-                col4.metric("Status DLB", "ESTÁVEL", delta="Normal")
+                col4.metric("Status DLB", "ESTÁVEL", delta="Rede Operacional")
 
-        if dados['dlb_ativo']:
-            st.error(f"ALERTA DE SOBRECARGA DETECTADO ({dados['hora']}:00h) - ATUANDO VIA PROTOCOLO DLB")
+        with st.container(border=True):
+            st.subheader("Métricas de Impacto Sustentável e Eficiência")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Demanda Líquida Final", f"{dados['demanda_final']:.1f} / {dados['potencia_limite']:.1f} kW")
+            m2.metric("CO2 Evitado (Hora)", f"{dados['co2_evitado_kg']:.2f} kgCO2")
+            m3.metric("Economia Estimada", f"R$ {dados['economia_reais']:.2f}")
+
+        if dados['dlb_ativo'] or dados['descarga_bateria_kw'] > 0:
+            st.warning(f"SISTEMA DE GESTÃO ATIVO ({dados['hora']}:00h) - Atuação de Mitigação Energética")
             for log in dados['logs_dlb']:
                 st.write(f"-> {log}")
         else:
-            st.success(f"STATUS: REDE ESTÁVEL ({dados['hora']}:00h) - Potência dentro dos limites.")
+            st.success(f"STATUS: REDE ESTÁVEL ({dados['hora']}:00h) - Operação sem restrições.")
 
         with st.container(border=True):
             st.subheader(f"Potência Alocada por Estação - {dados['hora']}:00h (kW)")
@@ -112,21 +142,34 @@ def renderizar_dashboard(dados, container):
                 x=alt.X('Estação:N', title='Estação', sort=None, axis=alt.Axis(labelAngle=0)),
                 y=alt.Y('Potência:Q', scale=alt.Scale(domain=[0, 25]), title='Potência (kW)'),
                 color=alt.value('#1f77b4')
-            ).properties(height=280)
+            ).properties(height=260)
 
             st.altair_chart(chart, use_container_width=True)
 
         with st.container(border=True):
-            st.subheader("Telemetria de Saída (Payload JSON)")
+            st.subheader("Assistente de Automação e Recomendações Inteligentes")
+            if dados['hora'] in [18, 19, 20]:
+                st.info("Recomendação do Sistema: Horário de pico detectado. O sistema utilizou o BESS GoodWe para atenuar o pico de demanda antes de aplicar o corte seletivo no DLB.")
+            elif 10 <= dados['hora'] <= 15:
+                st.info("Recomendação do Sistema: Excedente de geração solar detectado. Período ideal para recarga acelerada das baterias estacionárias e frotas comerciais.")
+            else:
+                st.info("Recomendação do Sistema: Operação em regime normal. Sem alertas de sobrecarga no momento.")
+
+        with st.container(border=True):
+            st.subheader("Telemetria Integrada de Saída (Payload JSON)")
             telemetria_json = {
                 "timestamp": int(time.time()),
                 "hora_simulada": f"{dados['hora']}:00h",
                 "periodo_operacional": dados['status_horario'],
                 "consumo_predio_kw": dados['consumo_predio'],
                 "geracao_solar_kw": dados['geracao_solar'],
+                "bateria_soc_percent": round(dados['soc_bateria'], 1),
+                "bateria_descarga_kw": round(dados['descarga_bateria_kw'], 1),
                 "demanda_liquida_kw": dados['demanda_liquida'],
                 "limite_contratado_kw": dados['potencia_limite'],
                 "dlb_acionado": dados['dlb_ativo'],
+                "co2_evitado_kg": round(dados['co2_evitado_kg'], 2),
+                "economia_estimada_rs": round(dados['economia_reais'], 2),
                 "estacoes_status": {k: {"potencia_kw": round(v["potencia_atual_kw"], 2), "prioridade": v["prioridade"]}
                                     for k, v in dados['estacoes'].items()}
             }
@@ -136,9 +179,10 @@ def renderizar_dashboard(dados, container):
 painel_dinamico = st.empty()
 
 if modo_simulacao == "Simulação Automática (24h)":
-    iniciar = st.sidebar.button("Play na Simulação (00h às 23h)")
+    iniciar = st.sidebar.button("Play na Simulação Integrada (00h às 23h)")
 
     if iniciar:
+        soc_atual = 95.0
         for h in range(24):
             if h == 17:
                 status_h = "TRANSIÇÃO FIM DE TARDE"
@@ -176,11 +220,12 @@ if modo_simulacao == "Simulação Automática (24h)":
                 g_solar = 0.0
                 p_limite = POTENCIA_CONTRATADA_BASE
 
-            res = processar_telemetria(h, c_predio, g_solar, p_limite, status_h)
+            res = processar_telemetria(h, c_predio, g_solar, p_limite, status_h, soc_atual)
+            soc_atual = res["soc_bateria"]
             renderizar_dashboard(res, painel_dinamico)
-            time.sleep(1.0)
+            time.sleep(0.8)
     else:
-        res = processar_telemetria(12, 85.0, 65.0, POTENCIA_CONTRATADA_BASE, "FORA DE PICO (DIURNO)")
+        res = processar_telemetria(12, 85.0, 65.0, POTENCIA_CONTRATADA_BASE, "FORA DE PICO (DIURNO)", 95.0)
         renderizar_dashboard(res, painel_dinamico)
 else:
     st.sidebar.header("Parâmetros do Prédio")
@@ -188,6 +233,7 @@ else:
     st.sidebar.header("Telemetria de Entrada")
     g_solar = st.sidebar.slider("Geração Solar Fotovoltaica (kW)", 0.0, 100.0, 45.0)
     c_predio = st.sidebar.slider("Consumo do Prédio (kW)", 50.0, 180.0, 130.0)
+    soc_manual = st.sidebar.slider("Bateria GoodWe BESS (SoC %)", 0.0, 100.0, 80.0)
 
-    res = processar_telemetria(12, c_predio, g_solar, p_limite, "MANUAL")
+    res = processar_telemetria(12, c_predio, g_solar, p_limite, "MANUAL", soc_manual)
     renderizar_dashboard(res, painel_dinamico)
